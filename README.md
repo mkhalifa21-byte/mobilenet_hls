@@ -1,7 +1,7 @@
 # MobileNetV1 on Kria K26 — HLS baseline
 
 EECS 298 final project. This is a hand translation of TF-slim `mobilenet_v1.py`
-into C for Vitis HLS: MobileNetV1, width multiplier α = 0.5, 224×224 input,
+into C for Vitis HLS: MobileNetV1, width multiplier α = 0.5, 160×160 input,
 1001 classes.
 
 This is the **baseline**. It has no performance pragmas, and every access goes
@@ -19,6 +19,7 @@ that has to keep `ALL TESTS PASSED`.
 | `tb_mobilenet.cpp` | no (testbench) | Kernel unit tests plus a full-network test, all bit-exact |
 | `script.tcl` | | Vitis HLS 2023.1 flow (csim + csynth) |
 | `Makefile` | | Quick g++ build: `make run` |
+| `python/export_weights.py` | no (run once, offline) | Converts the trained TF checkpoint into the `.bin` files |
 
 ## Python → C mapping
 
@@ -61,9 +62,29 @@ is non-trivial at every layer.
 - **Default:** deterministic random weights (He-style scale). Latency,
   resources and correctness are identical to using trained weights. The
   predicted class is meaningless.
-- **Trained weights:** put `weights.bin`, `biases.bin`, `shifts.bin` and
-  `image.bin` next to the executable, in the packed layout described in
-  `mobilenet.h` and `tb_mobilenet.cpp`. The testbench uses them automatically.
+- **Trained weights** (approved by the professor: Python is used once,
+  offline, only to export them):
+
+  ```sh
+  cd python
+  pip3 install -r requirements.txt          # tensorflow, numpy, pillow
+  # download mobilenet_v1_0.50_160.tgz from the "Pre-trained Models" table in
+  # the tensorflow/models repo (research/slim/README.md) and unpack it here
+  python3 export_weights.py --ckpt mobilenet_v1_0.5_160.ckpt --size 160 \
+                            --image some_photo.jpg
+  ```
+
+  This writes `weights.bin`, `biases.bin`, `shifts.bin`, `image.bin`,
+  `tf_logits.bin` and `export_report.txt` into the project folder. Then run
+  `make run` again. The testbench loads them automatically and also prints
+  how closely the int8 model agrees with the original float TensorFlow model
+  (top-1 match and score correlation; above 0.95 is good).
+
+  `export_weights.py` only reads the checkpoint with plain TensorFlow. It does
+  not need `tf_slim`, which no longer works with current TensorFlow. The
+  variable names it reads are the ones `mobilenet_v1.py` creates.
+
+  `--size` must equal `IMG_SIZE` in `mobilenet.h` (currently 160).
 
 ## Baseline numbers to record (from `solution/syn/report/`)
 

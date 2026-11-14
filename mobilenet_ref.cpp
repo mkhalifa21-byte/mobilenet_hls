@@ -20,7 +20,7 @@
  *   out [M][Ho][Ho]                                                        */
 void ref_conv2d(const data_t *in, int N, int H,
                 const wgt_t *w, const bias_t *b, int M, int K, int S,
-                int groups, int shift, data_t *out)
+                int groups, const int8_t *shift, data_t *out)
 {
     const int Ho  = out_size(H, S);
     const int pad = same_pad_begin(H, S, K);
@@ -45,7 +45,7 @@ void ref_conv2d(const data_t *in, int N, int H,
                         }
                     }
                 }
-                out[(m * Ho + oy) * Ho + ox] = requant(acc, shift, 1);
+                out[(m * Ho + oy) * Ho + ox] = requant(acc, shift[m], 1);
             }
         }
     }
@@ -109,18 +109,18 @@ void ref_mobilenet(const data_t *image, const wgt_t *weights,
         const int Ho = out_size(H, s);
 
         if (MOBILENET_DEFS[i].type == LT_CONV) {
-            ref_conv2d(in, cin, H, w, b, d, 3, s, 1, shifts[L], out);
+            ref_conv2d(in, cin, H, w, b, d, 3, s, 1, shifts + (b - biases), out);;
             if (trace) trace(L, "conv", out, d * Ho * Ho);
             L++; w += d * cin * 9; b += d;
             t = in; in = out; out = t;
         } else {
             /* depthwise: groups = cin */
-            ref_conv2d(in, cin, H, w, b, cin, 3, s, cin, shifts[L], out);
+            ref_conv2d(in, cin, H, w, b, cin, 3, s, cin, shifts + (b - biases), out);;
             if (trace) trace(L, "dw", out, cin * Ho * Ho);
             L++; w += cin * 9; b += cin;
             t = in; in = out; out = t;
             /* pointwise: K = 1 */
-            ref_conv2d(in, cin, Ho, w, b, d, 1, 1, 1, shifts[L], out);
+            ref_conv2d(in, cin, Ho, w, b, d, 1, 1, 1, shifts + (b - biases), out);
             if (trace) trace(L, "pw", out, d * Ho * Ho);
             L++; w += cin * d; b += d;
             t = in; in = out; out = t;

@@ -1,0 +1,34 @@
+layer                      shape (C layout)   max|w| shifts  w error
+Conv2d_0                      (16, 3, 3, 3)    2.053  5-14    1.07%
+Conv2d_1_depthwise               (16, 3, 3)   68.140  0-10    0.83%
+Conv2d_1_pointwise                 (32, 16)    9.346  3-14    0.94%
+Conv2d_2_depthwise               (32, 3, 3)   20.356  2-9     0.67%
+Conv2d_2_pointwise                 (64, 32)    3.881  5-14    1.19%
+Conv2d_3_depthwise               (64, 3, 3)   29.555  2-9     0.92%
+Conv2d_3_pointwise                 (64, 64)    3.990  4-10    1.82%
+Conv2d_4_depthwise               (64, 3, 3)    2.915  5-9     0.53%
+Conv2d_4_pointwise                (128, 64)    1.798  6-10    1.52%
+Conv2d_5_depthwise              (128, 3, 3)   10.743  3-9     0.82%
+Conv2d_5_pointwise               (128, 128)    2.111  5-9     1.58%
+Conv2d_6_depthwise              (128, 3, 3)    1.532  6-8     0.58%
+Conv2d_6_pointwise               (256, 128)    1.405  6-10    1.76%
+Conv2d_7_depthwise              (256, 3, 3)    4.641  4-9     0.83%
+Conv2d_7_pointwise               (256, 256)    0.902  7-10    1.68%
+Conv2d_8_depthwise              (256, 3, 3)    3.602  5-9     0.85%
+Conv2d_8_pointwise               (256, 256)    0.808  7-10    1.59%
+Conv2d_9_depthwise              (256, 3, 3)    4.254  4-9     0.91%
+Conv2d_9_pointwise               (256, 256)    0.922  7-10    1.47%
+Conv2d_10_depthwise             (256, 3, 3)    4.793  4-9     0.87%
+Conv2d_10_pointwise              (256, 256)    1.065  6-10    1.47%
+Conv2d_11_depthwise             (256, 3, 3)    2.932  5-9     0.81%
+Conv2d_11_pointwise              (256, 256)    1.195  6-10    1.36%
+Conv2d_12_depthwise             (256, 3, 3)    1.860  6-9     0.55%
+Conv2d_12_pointwise              (512, 256)    1.457  6-10    1.32%
+Conv2d_13_depthwise             (512, 3, 3)    8.042  3-8     0.62%
+Conv2d_13_pointwise              (512, 512)    3.165  5-7     1.41%
+Logits                          (1001, 512)    0.906  7-7     2.42%
+
+weights: 1320160 int8   (W_TOTAL in mobilenet.h)
+biases : 6473 int32  (B_TOTAL in mobilenet.h)
+image  : 160x160  (IMG_SIZE in mobilenet.h must match)
+TensorFlow float top-5 classes: [505, 969, 900, 648, 726]

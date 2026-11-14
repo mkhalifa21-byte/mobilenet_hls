@@ -1,0 +1,24 @@
+# build output
+tb
+*.o
+
+# generated data (recreate with python/export_weights.py)
+*.bin
+
+# Vitis HLS project folder created by script.tcl
+mobilenet_hls/
+
+# downloaded checkpoint files (too big; README says where to get them)
+python/*.ckpt*
+python/*.tgz
+python/*.tflite
+python/*.pb
+python/*.pbtxt
+python/*.meta
+python/*_info.txt
+
+# test photos and Mac system files
+python/*.jpg
+python/*.jpeg
+python/*.png
+.DS_Store

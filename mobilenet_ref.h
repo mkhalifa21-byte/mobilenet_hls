@@ -9,7 +9,7 @@ typedef void (*ref_trace_fn)(int layer, const char *kind,
 
 void ref_conv2d(const data_t *in, int N, int H,
                 const wgt_t *w, const bias_t *b, int M, int K, int S,
-                int groups, int shift, data_t *out);
+                int groups, const int8_t *shift, data_t *out);
 void ref_avgpool(const data_t *in, int C, int H, data_t *out);
 void ref_fc(const data_t *in, int N, const wgt_t *w, const bias_t *b, int M,
             acc_t *logits);

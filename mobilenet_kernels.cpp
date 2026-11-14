@@ -16,19 +16,20 @@
 #include "mobilenet.h"
 
 /* ------------------------------------------------------------------------
- * Standard 3x3 convolution (only used by layer Conv2d_0: 3 -> 16 channels)
+ * Standard 3x3 convolution (only used by layer Conv2d_0: 3 -> 16 channels,
+ * 160x160 -> 80x80)
  *   in  [N][H][H]   out [M][Ho][Ho]   w [M][N][3][3]   b [M]
  * ------------------------------------------------------------------------ */
 void conv3x3(const data_t *in, data_t *out, const wgt_t *w, const bias_t *b,
-             int N, int M, int H, int S, int shift)
+             int N, int M, int H, int S, const int8_t *shift)
 {
     const int Ho  = out_size(H, S);
     const int pad = same_pad_begin(H, S, 3);
 
 ROW: for (int row = 0; row < Ho; row++) {
-#pragma HLS LOOP_TRIPCOUNT min=112 max=112
+#pragma HLS LOOP_TRIPCOUNT min=80 max=80
     COL: for (int col = 0; col < Ho; col++) {
-#pragma HLS LOOP_TRIPCOUNT min=112 max=112
+#pragma HLS LOOP_TRIPCOUNT min=80 max=80
         TO: for (int to = 0; to < M; to++) {
 #pragma HLS LOOP_TRIPCOUNT min=16 max=16
             acc_t acc = b[to];
@@ -44,7 +45,7 @@ ROW: for (int row = 0; row < Ho; row++) {
                     }
                 }
             }
-            out[(to * Ho + row) * Ho + col] = requant(acc, shift, 1);
+            out[(to * Ho + row) * Ho + col] = requant(acc, shift[to], 1);
         }
     }
 }
@@ -56,15 +57,15 @@ ROW: for (int row = 0; row < Ho; row++) {
  *   in [C][H][H]   out [C][Ho][Ho]   w [C][3][3]   b [C]
  * ------------------------------------------------------------------------ */
 void dwconv3x3(const data_t *in, data_t *out, const wgt_t *w, const bias_t *b,
-               int C, int H, int S, int shift)
+               int C, int H, int S, const int8_t *shift)
 {
     const int Ho  = out_size(H, S);
     const int pad = same_pad_begin(H, S, 3);
 
 ROW: for (int row = 0; row < Ho; row++) {
-#pragma HLS LOOP_TRIPCOUNT min=7 max=112
+#pragma HLS LOOP_TRIPCOUNT min=5 max=80
     COL: for (int col = 0; col < Ho; col++) {
-#pragma HLS LOOP_TRIPCOUNT min=7 max=112
+#pragma HLS LOOP_TRIPCOUNT min=5 max=80
         CH: for (int c = 0; c < C; c++) {
 #pragma HLS LOOP_TRIPCOUNT min=16 max=512
             acc_t acc = b[c];
@@ -77,7 +78,7 @@ ROW: for (int row = 0; row < Ho; row++) {
                                (acc_t)w[(c * 3 + i) * 3 + j];
                 }
             }
-            out[(c * Ho + row) * Ho + col] = requant(acc, shift, 1);
+            out[(c * Ho + row) * Ho + col] = requant(acc, shift[c], 1);
         }
     }
 }
@@ -88,14 +89,14 @@ ROW: for (int row = 0; row < Ho; row++) {
  *   in [N][H][H]   out [M][H][H]   w [M][N]   b [M]
  * ------------------------------------------------------------------------ */
 void conv1x1(const data_t *in, data_t *out, const wgt_t *w, const bias_t *b,
-             int N, int M, int H, int shift)
+             int N, int M, int H, const int8_t *shift)
 {
     const int HW = H * H;
 
 ROW: for (int row = 0; row < H; row++) {
-#pragma HLS LOOP_TRIPCOUNT min=7 max=112
+#pragma HLS LOOP_TRIPCOUNT min=5 max=80
     COL: for (int col = 0; col < H; col++) {
-#pragma HLS LOOP_TRIPCOUNT min=7 max=112
+#pragma HLS LOOP_TRIPCOUNT min=5 max=80
         TO: for (int to = 0; to < M; to++) {
 #pragma HLS LOOP_TRIPCOUNT min=32 max=512
             acc_t acc = b[to];
@@ -104,14 +105,15 @@ ROW: for (int row = 0; row < H; row++) {
                 acc += (acc_t)in[ti * HW + row * H + col] *
                        (acc_t)w[to * N + ti];
             }
-            out[to * HW + row * H + col] = requant(acc, shift, 1);
+            out[to * HW + row * H + col] = requant(acc, shift[to], 1);
         }
     }
 }
 }
 
 /* ------------------------------------------------------------------------
- * Global average pool: [C][H][H] -> [C]   (AvgPool_1a, 7x7 VALID)
+ * Global average pool: [C][H][H] -> [C]   (AvgPool_1a: 5x5 at 160 input,
+ * 7x7 at 224 input; slim shrinks the 7x7 kernel to the map size)
  * Inputs are >= 0 (after ReLU6), so (sum + HW/2) / HW rounds to nearest.
  * ------------------------------------------------------------------------ */
 void avgpool(const data_t *in, data_t *out, int C, int H)
@@ -121,7 +123,7 @@ CH: for (int c = 0; c < C; c++) {
 #pragma HLS LOOP_TRIPCOUNT min=512 max=512
         acc_t sum = 0;
     PIX: for (int p = 0; p < HW; p++) {
-#pragma HLS LOOP_TRIPCOUNT min=49 max=49
+#pragma HLS LOOP_TRIPCOUNT min=25 max=25
             sum += in[c * HW + p];
         }
         out[c] = (data_t)((sum + HW / 2) / HW);

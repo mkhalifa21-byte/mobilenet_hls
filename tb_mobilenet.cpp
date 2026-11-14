@@ -5,7 +5,7 @@
  *         compared bit-exactly with the golden reference. Shapes include
  *         stride 1, stride 2 and the odd 7x7 size of the last layers.
  * Part 2: full network. mobilenet_top() vs ref_mobilenet() on a whole
- *         224x224 image; all 1001 logits must match exactly.
+ *         160x160 image; all 1001 logits must match exactly.
  *
  * Weights: if weights.bin, biases.bin, shifts.bin and image.bin are all
  * present in the run directory, they are loaded (real trained model).
@@ -16,8 +16,8 @@
  * Binary file formats (raw, little-endian, packed as in mobilenet.h):
  *   weights.bin  int8   x W_TOTAL
  *   biases.bin   int32  x B_TOTAL
- *   shifts.bin   int8   x NUM_CONV
- *   image.bin    int8   x 3*224*224   (Q4.4, [channel][row][col])
+ *   shifts.bin   int8   x S_TOTAL     (one per conv output channel)
+ *   image.bin    int16  x 3*160*160   (Q8.8, [channel][row][col])
  *
  * Returns 0 on PASS, 1 on FAIL (Vitis HLS uses this to decide csim result).
  */
@@ -89,23 +89,28 @@ static void fill_wgt(wgt_t *a, int n)
 { for (int i = 0; i < n; i++) a[i] = (wgt_t)rng_int(-64, 63); }
 static void fill_bias(bias_t *a, int n)
 { for (int i = 0; i < n; i++) a[i] = rng_int(-2000, 2000); }
+/* different shift per output channel, around "base" (tests per-channel) */
+static void fill_shift(int8_t *a, int n, int base)
+{ for (int i = 0; i < n; i++) a[i] = (int8_t)(base - 1 + i % 3); }
 
 /* ======================= PART 1: unit tests ============================== */
 static int test_conv3x3(int N, int M, int H, int S)
 {
-    const int Ho = out_size(H, S), shift = 7;
-    data_t *in  = (data_t *)malloc(N * H * H);
+    const int Ho = out_size(H, S);
+    int8_t shift[1024];
+    data_t *in  = (data_t *)malloc(N * H * H * sizeof(data_t));
     wgt_t  *w   = (wgt_t  *)malloc(M * N * 9);
     bias_t *b   = (bias_t *)malloc(M * sizeof(bias_t));
-    data_t *got = (data_t *)malloc(M * Ho * Ho);
-    data_t *exp = (data_t *)malloc(M * Ho * Ho);
-    fill_data(in, N * H * H, -16, 15); fill_wgt(w, M * N * 9); fill_bias(b, M);
+    data_t *got = (data_t *)malloc(M * Ho * Ho * sizeof(data_t));
+    data_t *exp = (data_t *)malloc(M * Ho * Ho * sizeof(data_t));
+    fill_data(in, N * H * H, -256, 255); fill_wgt(w, M * N * 9); fill_bias(b, M);
+    fill_shift(shift, M, 3);
 
     conv3x3(in, got, w, b, N, M, H, S, shift);
     ref_conv2d(in, N, H, w, b, M, 3, S, 1, shift, exp);
 
     char name[80];
-    sprintf(name, "conv3x3   N=%d M=%d H=%d S=%d", N, M, H, S);
+    snprintf(name, sizeof(name), "conv3x3   N=%d M=%d H=%d S=%d", N, M, H, S);
     int e = compare_data(name, got, exp, M * Ho * Ho);
     free(in); free(w); free(b); free(got); free(exp);
     return e;
@@ -113,19 +118,21 @@ static int test_conv3x3(int N, int M, int H, int S)
 
 static int test_dwconv3x3(int C, int H, int S)
 {
-    const int Ho = out_size(H, S), shift = 6;
-    data_t *in  = (data_t *)malloc(C * H * H);
+    const int Ho = out_size(H, S);
+    int8_t shift[1024];
+    data_t *in  = (data_t *)malloc(C * H * H * sizeof(data_t));
     wgt_t  *w   = (wgt_t  *)malloc(C * 9);
     bias_t *b   = (bias_t *)malloc(C * sizeof(bias_t));
-    data_t *got = (data_t *)malloc(C * Ho * Ho);
-    data_t *exp = (data_t *)malloc(C * Ho * Ho);
+    data_t *got = (data_t *)malloc(C * Ho * Ho * sizeof(data_t));
+    data_t *exp = (data_t *)malloc(C * Ho * Ho * sizeof(data_t));
     fill_data(in, C * H * H, 0, RELU6_MAX); fill_wgt(w, C * 9); fill_bias(b, C);
+    fill_shift(shift, C, 6);
 
     dwconv3x3(in, got, w, b, C, H, S, shift);
     ref_conv2d(in, C, H, w, b, C, 3, S, C, shift, exp);
 
     char name[80];
-    sprintf(name, "dwconv3x3 C=%d H=%d S=%d", C, H, S);
+    snprintf(name, sizeof(name), "dwconv3x3 C=%d H=%d S=%d", C, H, S);
     int e = compare_data(name, got, exp, C * Ho * Ho);
     free(in); free(w); free(b); free(got); free(exp);
     return e;
@@ -133,19 +140,20 @@ static int test_dwconv3x3(int C, int H, int S)
 
 static int test_conv1x1(int N, int M, int H)
 {
-    const int shift = 9;
-    data_t *in  = (data_t *)malloc(N * H * H);
+    int8_t shift[1024];
+    data_t *in  = (data_t *)malloc(N * H * H * sizeof(data_t));
     wgt_t  *w   = (wgt_t  *)malloc(M * N);
     bias_t *b   = (bias_t *)malloc(M * sizeof(bias_t));
-    data_t *got = (data_t *)malloc(M * H * H);
-    data_t *exp = (data_t *)malloc(M * H * H);
+    data_t *got = (data_t *)malloc(M * H * H * sizeof(data_t));
+    data_t *exp = (data_t *)malloc(M * H * H * sizeof(data_t));
     fill_data(in, N * H * H, 0, RELU6_MAX); fill_wgt(w, M * N); fill_bias(b, M);
+    fill_shift(shift, M, 9);
 
     conv1x1(in, got, w, b, N, M, H, shift);
     ref_conv2d(in, N, H, w, b, M, 1, 1, 1, shift, exp);
 
     char name[80];
-    sprintf(name, "conv1x1   N=%d M=%d H=%d", N, M, H);
+    snprintf(name, sizeof(name), "conv1x1   N=%d M=%d H=%d", N, M, H);
     int e = compare_data(name, got, exp, M * H * H);
     free(in); free(w); free(b); free(got); free(exp);
     return e;
@@ -153,13 +161,13 @@ static int test_conv1x1(int N, int M, int H)
 
 static int test_avgpool(int C, int H)
 {
-    data_t *in = (data_t *)malloc(C * H * H);
+    data_t *in = (data_t *)malloc(C * H * H * sizeof(data_t));
     data_t got[1024], exp[1024];
     fill_data(in, C * H * H, 0, RELU6_MAX);
     avgpool(in, got, C, H);
     ref_avgpool(in, C, H, exp);
     char name[80];
-    sprintf(name, "avgpool   C=%d H=%d", C, H);
+    snprintf(name, sizeof(name), "avgpool   C=%d H=%d", C, H);
     int e = compare_data(name, got, exp, C);
     free(in);
     return e;
@@ -174,7 +182,7 @@ static int test_fc(int N, int M)
     fc(in, got, w, b, N, M);
     ref_fc(in, N, w, b, M, exp);
     char name[80];
-    sprintf(name, "fc        N=%d M=%d", N, M);
+    snprintf(name, sizeof(name), "fc        N=%d M=%d", N, M);
     int e = compare_acc(name, got, exp, M);
     free(w); free(b);
     return e;
@@ -182,45 +190,55 @@ static int test_fc(int N, int M)
 
 /* ======================= PART 2: full network ============================ */
 
-/* Random but "realistic" parameters: weights uniform in +-sqrt(6/fan_in)
- * (He initialization, x1.6 gain, slightly positive bias) so activations neither die nor all saturate, and the
- * per-layer shift is the largest that still fits the weights in int8. */
+/* Random but "realistic" parameters (He-style scale), see QUANT_LAYER. */
 static void make_random_params(wgt_t *W, bias_t *B, int8_t *shifts)
 {
-    int cin = IMG_CH, w = 0, b = 0, L = 0;
+    int cin = IMG_CH, w = 0, b = 0;
 
-    /* quantize one layer: count weights, fan_in = inputs per output */
-    #define QUANT_LAYER(count, nbias, fan_in)                                  \
+    /* one layer: M output channels, K weights per output channel.
+     * Weights uniform in +-1.6*sqrt(6/K); each output channel gets its own
+     * shift = largest value (0..14) that still fits its weights in int8.
+     * Shift array uses the same index as the bias array. The fc layer
+     * (has_shift = 0) uses one shift for all rows so its scores share a scale. */
+    #define QUANT_LAYER(M, K, has_shift)                                       \
     do {                                                                       \
-        float lim = 1.6f * sqrtf(6.0f / (float)(fan_in)), mx = 0.0f;                  \
-        float *tmp = (float *)malloc((count) * sizeof(float));                 \
-        for (int k = 0; k < (count); k++) {                                    \
+        float lim = 1.6f * sqrtf(6.0f / (float)(K));                           \
+        float *tmp = (float *)malloc((M) * (K) * sizeof(float));               \
+        float lmx = 0.0f;                                                      \
+        for (int k = 0; k < (M) * (K); k++) {                                  \
             tmp[k] = rng_uniform(-lim, lim);                                   \
-            if (fabsf(tmp[k]) > mx) mx = fabsf(tmp[k]);                        \
+            if (fabsf(tmp[k]) > lmx) lmx = fabsf(tmp[k]);                      \
         }                                                                      \
-        int sh = (int)floorf(log2f(127.0f / mx));                              \
-        sh = clampi(sh, 1, 14);                                                \
-        if (L < NUM_CONV) shifts[L] = (int8_t)sh;                              \
-        for (int k = 0; k < (count); k++)                                      \
-            W[w + k] = (wgt_t)clampi((int)lrintf(tmp[k] * (1 << sh)), -128, 127); \
-        for (int k = 0; k < (nbias); k++)                                      \
-            B[b + k] = (bias_t)lrintf(rng_uniform(-0.05f, 0.25f) *             \
+        for (int m = 0; m < (M); m++) {                                        \
+            float mx = lmx;                                                    \
+            if (has_shift) {                                                   \
+                mx = 0.0f;                                                     \
+                for (int k = 0; k < (K); k++)                                  \
+                    if (fabsf(tmp[m * (K) + k]) > mx) mx = fabsf(tmp[m * (K) + k]); \
+            }                                                                  \
+            int sh = clampi((int)floorf(log2f(127.0f / mx)), 0, 14);           \
+            if (has_shift) shifts[b + m] = (int8_t)sh;                         \
+            for (int k = 0; k < (K); k++)                                      \
+                W[w + m * (K) + k] = (wgt_t)clampi(                            \
+                    (int)lrintf(tmp[m * (K) + k] * (1 << sh)), -128, 127);     \
+            B[b + m] = (bias_t)lrintf(rng_uniform(-0.05f, 0.25f) *             \
                                       (float)(1 << (FA + sh)));                \
+        }                                                                      \
         free(tmp);                                                             \
-        w += (count); b += (nbias); L++;                                       \
+        w += (M) * (K); b += (M);                                              \
     } while (0)
 
     for (int i = 0; i < NUM_DEFS; i++) {
         const int d = scaled_depth(MOBILENET_DEFS[i].depth);
         if (MOBILENET_DEFS[i].type == LT_CONV) {
-            QUANT_LAYER(d * cin * 9, d, cin * 9);
+            QUANT_LAYER(d, cin * 9, 1);
         } else {
-            QUANT_LAYER(cin * 9, cin, 9);          /* depthwise */
-            QUANT_LAYER(cin * d, d, cin);          /* pointwise */
+            QUANT_LAYER(cin, 9, 1);                /* depthwise */
+            QUANT_LAYER(d, cin, 1);                /* pointwise */
         }
         cin = d;
     }
-    QUANT_LAYER(cin * NUM_CLASSES, NUM_CLASSES, cin);   /* fc */
+    QUANT_LAYER(NUM_CLASSES, cin, 0);              /* fc */
     #undef QUANT_LAYER
 }
 
@@ -270,6 +288,14 @@ int main(void)
     ref_param_totals(&wt, &bt);
     printf("Parameter totals: weights %d (W_TOTAL %d), biases %d (B_TOTAL %d)\n",
            wt, W_TOTAL, bt, B_TOTAL);
+    if (IMG_CH * IMG_SIZE * IMG_SIZE != IMG_DEPTH_PRAGMA ||
+        FM_TOTAL != FM_DEPTH_PRAGMA) {
+        printf("ERROR: image/fm sizes changed: update IMG_DEPTH_PRAGMA, "
+               "FM_DEPTH_PRAGMA in mobilenet.h and the depth= values in "
+               "mobilenet_top.cpp (image %d, fm %d)\n",
+               IMG_CH * IMG_SIZE * IMG_SIZE, FM_TOTAL);
+        return 1;
+    }
     if (wt != W_TOTAL || bt != B_TOTAL) {
         printf("ERROR: update W_TOTAL / B_TOTAL in mobilenet.h (and the m_axi "
                "depth= values in mobilenet_top.cpp)\n");
@@ -284,9 +310,12 @@ int main(void)
     errors += test_dwconv3x3(16, 8, 2);     /* asymmetric SAME padding     */
     errors += test_dwconv3x3(32, 7, 1);     /* 7x7 like the last layers    */
     errors += test_dwconv3x3(8, 14, 2);
+    errors += test_dwconv3x3(16, 5, 1);     /* 5x5 like the last layers at 160 */
+    errors += test_dwconv3x3(16, 10, 2);    /* 10 -> 5, stride 2 at 160    */
     errors += test_conv1x1(16, 32, 8);
     errors += test_conv1x1(64, 16, 7);
     errors += test_avgpool(32, 7);
+    errors += test_avgpool(64, 5);          /* final pool at 160 input     */
     errors += test_fc(64, 10);
 
     /* ---------------- Part 2 ---------------- */
@@ -294,19 +323,19 @@ int main(void)
            ALPHA_NUM, ALPHA_DEN, IMG_SIZE, IMG_SIZE);
 
     const int IMG_N = IMG_CH * IMG_SIZE * IMG_SIZE;
-    data_t *image   = (data_t *)malloc(IMG_N);
+    data_t *image   = (data_t *)malloc(IMG_N * sizeof(data_t));
     wgt_t  *weights = (wgt_t  *)malloc(W_TOTAL);
     bias_t *biases  = (bias_t *)malloc(B_TOTAL * sizeof(bias_t));
-    int8_t  shifts[NUM_CONV];
-    data_t *fm      = (data_t *)calloc(FM_TOTAL, 1);
-    data_t *ref_a   = (data_t *)malloc(FM_MAX);
-    data_t *ref_b   = (data_t *)malloc(FM_MAX);
+    int8_t  shifts[S_TOTAL];
+    data_t *fm      = (data_t *)calloc(FM_TOTAL, sizeof(data_t));
+    data_t *ref_a   = (data_t *)malloc(FM_MAX * sizeof(data_t));
+    data_t *ref_b   = (data_t *)malloc(FM_MAX * sizeof(data_t));
     acc_t   logits_hw[NUM_CLASSES], logits_ref[NUM_CLASSES];
 
     int real = load_file("weights.bin", weights, W_TOTAL) &&
                load_file("biases.bin",  biases,  B_TOTAL * sizeof(bias_t)) &&
-               load_file("shifts.bin",  shifts,  NUM_CONV) &&
-               load_file("image.bin",   image,   IMG_N);
+               load_file("shifts.bin",  shifts,  S_TOTAL) &&
+               load_file("image.bin",   image,   IMG_N * sizeof(data_t));
     if (real) {
         printf("  Loaded trained weights + image from .bin files\n");
     } else {
@@ -335,6 +364,39 @@ int main(void)
            t5_hw[0], t5_hw[1], t5_hw[2], t5_hw[3], t5_hw[4],
            t5_ref[0], t5_ref[1], t5_ref[2], t5_ref[3], t5_ref[4]);
     if (!real) printf("  (random weights: class numbers are meaningless)\n");
+
+    /* Optional: compare with the original float TensorFlow model.
+     * This is NOT a pass/fail check (8-bit hardware cannot match float
+     * exactly); it shows how close the quantized model is.
+     * Correlation (Pearson) of the 1001 scores:
+     *   r = sum((a-mean_a)(b-mean_b)) / sqrt(sum((a-mean_a)^2) sum((b-mean_b)^2))
+     *   a = C/HLS score of class i, b = TensorFlow score of class i.
+     *   r = 1.0 means identical shape; scale does not matter.            */
+    float tf_logits[NUM_CLASSES];
+    if (real && load_file("tf_logits.bin", tf_logits, sizeof(tf_logits))) {
+        double ma = 0, mb = 0, sab = 0, saa = 0, sbb = 0;
+        for (int i = 0; i < NUM_CLASSES; i++) { ma += logits_hw[i]; mb += tf_logits[i]; }
+        ma /= NUM_CLASSES; mb /= NUM_CLASSES;
+        for (int i = 0; i < NUM_CLASSES; i++) {
+            double a = logits_hw[i] - ma, b = tf_logits[i] - mb;
+            sab += a * b; saa += a * a; sbb += b * b;
+        }
+        int t5_tf[5];
+        for (int k = 0; k < 5; k++) {        /* top-5 of the float scores */
+            int best = -1;
+            for (int i = 0; i < NUM_CLASSES; i++) {
+                int used = 0;
+                for (int j = 0; j < k; j++) used |= (t5_tf[j] == i);
+                if (!used && (best < 0 || tf_logits[i] > tf_logits[best])) best = i;
+            }
+            t5_tf[k] = best;
+        }
+        printf("\n  vs. TensorFlow float model (tf_logits.bin):\n");
+        printf("    TF top-5 classes : %d %d %d %d %d\n",
+               t5_tf[0], t5_tf[1], t5_tf[2], t5_tf[3], t5_tf[4]);
+        printf("    Top-1 agrees     : %s\n", t5_tf[0] == t5_hw[0] ? "YES" : "NO");
+        printf("    Score correlation: %.4f\n", sab / sqrt(saa * sbb + 1e-30));
+    }
 
     free(image); free(weights); free(biases); free(fm); free(ref_a); free(ref_b);
 
