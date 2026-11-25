@@ -39,13 +39,21 @@
 
 #include <stdint.h>
 
-typedef int16_t  data_t;
+typedef int16_t data_t;
 typedef int8_t  wgt_t;
 typedef int32_t bias_t;
 typedef int32_t acc_t;
 
+/* 128-bit weight word = 16 int8 weights (v5). The weights array in DDR is
+ * the same bytes as before; only the pointer type changes, so HLS builds a
+ * 128-bit m_axi port and reads 16 weights per cycle. Every layer's weight
+ * block starts on a 16-byte boundary (all channel counts are multiples of
+ * 16), so word index = byte offset / 16. */
+#define WVEC 16
+typedef struct { wgt_t v[WVEC]; } wvec_t;
+
 #define FA         8                 /* fractional bits of data_t        */
-#define RELU6_MAX  (6 << FA)         /* 6.0 in Q4.4 = 96                 */
+#define RELU6_MAX  (6 << FA)         /* 6.0 in Q8.8 = 1536               */
 
 /* ---- width multiplier alpha = ALPHA_NUM / ALPHA_DEN (0.5) ------------- */
 #define ALPHA_NUM  1
@@ -58,7 +66,8 @@ typedef int32_t acc_t;
 #define NUM_CLASSES  1001            /* slim checkpoints: class 0 = background */
 #define NUM_DEFS     14              /* entries in MOBILENET_DEFS          */
 #define NUM_CONV     27              /* conv0 + 13 x (dw + pw)             */
-#define S_TOTAL      5472            /* one shift per conv output channel = B_TOTAL - NUM_CLASSES */
+#define S_TOTAL      5472            /* one shift per conv output channel  */
+                                     /* = B_TOTAL - NUM_CLASSES            */
 
 /* Largest feature map = output of layer 1 (Conv2d_1_pointwise):
  *   (IMG_SIZE/2) x (IMG_SIZE/2) x (64*alpha)
@@ -82,6 +91,7 @@ typedef int32_t acc_t;
  * If you change alpha, the testbench prints the new values to put here. */
 #define W_TOTAL  1320160             /* 807,648 conv + 512,512 fc          */
 #define B_TOTAL  6473
+#define W_WORDS  (W_TOTAL / WVEC)   /* 82,510 128-bit weight words */
 
 /* ---- layer table: direct copy of MOBILENETV1_CONV_DEFS (lines 123-138) -- */
 enum { LT_CONV = 0, LT_DWSEP = 1 };
@@ -138,29 +148,29 @@ static inline data_t requant(acc_t acc, int shift, int relu6)
     acc_t rnd = (shift > 0) ? ((acc_t)1 << (shift - 1)) : 0;
     acc_t r   = (acc + rnd) >> shift;
     acc_t lo  = relu6 ? 0 : -32768;
-    acc_t hi  = relu6 ? RELU6_MAX : 32767;        // come back to this if theres an issue
+    acc_t hi  = relu6 ? RELU6_MAX : 32767;
     if (r < lo) r = lo;
     if (r > hi) r = hi;
     return (data_t)r;
 }
 
 /* ---- HLS kernels (mobilenet_kernels.cpp) ------------------------------ */
-void conv3x3(const data_t *in, data_t *out, const wgt_t *w, const bias_t *b,
+void conv3x3(const data_t *in, data_t *out, const wvec_t *w, const bias_t *b,
              int N, int M, int H, int S, const int8_t *shift);
-void dwconv3x3(const data_t *in, data_t *out, const wgt_t *w, const bias_t *b,
+void dwconv3x3(const data_t *in, data_t *out, const wvec_t *w, const bias_t *b,
                int C, int H, int S, const int8_t *shift);
-void conv1x1(const data_t *in, data_t *out, const wgt_t *w, const bias_t *b,
+void conv1x1(const data_t *in, data_t *out, const wvec_t *w, const bias_t *b,
              int N, int M, int H, const int8_t *shift);
 void avgpool(const data_t *in, data_t *out, int C, int H);
-void fc(const data_t *in, acc_t *logits, const wgt_t *w, const bias_t *b,
+void fc(const data_t *in, acc_t *logits, const wvec_t *w, const bias_t *b,
         int N, int M);
 
 /* ---- HLS top function (mobilenet_top.cpp) ----------------------------- */
 void mobilenet_top(const data_t *image,     /* [3][IMG_SIZE][IMG_SIZE] */
                    data_t       *fm,        /* [FM_TOTAL] scratch DDR */
-                   const wgt_t  *weights,   /* [W_TOTAL]              */
+                   const wvec_t *weights,   /* [W_WORDS] 128-bit      */
                    const bias_t *biases,    /* [B_TOTAL]              */
-                   const int8_t *shifts,    /* [NUM_CONV]             */
+                   const int8_t *shifts,    /* [S_TOTAL]              */
                    acc_t        *logits);   /* [NUM_CLASSES]          */
 
 #endif

@@ -83,6 +83,15 @@ static int compare_acc(const char *name, const acc_t *got, const acc_t *exp,
     return errors;
 }
 
+/* v5: kernels read weights as 128-bit words (16 bytes), so weight buffers
+ * are rounded up to a multiple of 16 bytes and zero-padded. */
+static wgt_t *alloc_w(int n)
+{
+    return (wgt_t *)calloc((size_t)((n + WVEC - 1) / WVEC) * WVEC, 1);
+}
+#define AS_WVEC(p) ((const wvec_t *)(p))
+static_assert(sizeof(wvec_t) == 16, "wvec_t must be exactly 16 bytes (128 bits)");
+
 static void fill_data(data_t *a, int n, int lo, int hi)
 { for (int i = 0; i < n; i++) a[i] = (data_t)rng_int(lo, hi); }
 static void fill_wgt(wgt_t *a, int n)
@@ -99,14 +108,14 @@ static int test_conv3x3(int N, int M, int H, int S)
     const int Ho = out_size(H, S);
     int8_t shift[1024];
     data_t *in  = (data_t *)malloc(N * H * H * sizeof(data_t));
-    wgt_t  *w   = (wgt_t  *)malloc(M * N * 9);
+    wgt_t  *w   = alloc_w(M * N * 9);
     bias_t *b   = (bias_t *)malloc(M * sizeof(bias_t));
     data_t *got = (data_t *)malloc(M * Ho * Ho * sizeof(data_t));
     data_t *exp = (data_t *)malloc(M * Ho * Ho * sizeof(data_t));
     fill_data(in, N * H * H, -256, 255); fill_wgt(w, M * N * 9); fill_bias(b, M);
     fill_shift(shift, M, 3);
 
-    conv3x3(in, got, w, b, N, M, H, S, shift);
+    conv3x3(in, got, AS_WVEC(w), b, N, M, H, S, shift);
     ref_conv2d(in, N, H, w, b, M, 3, S, 1, shift, exp);
 
     char name[80];
@@ -121,14 +130,14 @@ static int test_dwconv3x3(int C, int H, int S)
     const int Ho = out_size(H, S);
     int8_t shift[1024];
     data_t *in  = (data_t *)malloc(C * H * H * sizeof(data_t));
-    wgt_t  *w   = (wgt_t  *)malloc(C * 9);
+    wgt_t  *w   = alloc_w(C * 9);
     bias_t *b   = (bias_t *)malloc(C * sizeof(bias_t));
     data_t *got = (data_t *)malloc(C * Ho * Ho * sizeof(data_t));
     data_t *exp = (data_t *)malloc(C * Ho * Ho * sizeof(data_t));
     fill_data(in, C * H * H, 0, RELU6_MAX); fill_wgt(w, C * 9); fill_bias(b, C);
     fill_shift(shift, C, 6);
 
-    dwconv3x3(in, got, w, b, C, H, S, shift);
+    dwconv3x3(in, got, AS_WVEC(w), b, C, H, S, shift);
     ref_conv2d(in, C, H, w, b, C, 3, S, C, shift, exp);
 
     char name[80];
@@ -142,14 +151,14 @@ static int test_conv1x1(int N, int M, int H)
 {
     int8_t shift[1024];
     data_t *in  = (data_t *)malloc(N * H * H * sizeof(data_t));
-    wgt_t  *w   = (wgt_t  *)malloc(M * N);
+    wgt_t  *w   = alloc_w(M * N);
     bias_t *b   = (bias_t *)malloc(M * sizeof(bias_t));
     data_t *got = (data_t *)malloc(M * H * H * sizeof(data_t));
     data_t *exp = (data_t *)malloc(M * H * H * sizeof(data_t));
     fill_data(in, N * H * H, 0, RELU6_MAX); fill_wgt(w, M * N); fill_bias(b, M);
     fill_shift(shift, M, 9);
 
-    conv1x1(in, got, w, b, N, M, H, shift);
+    conv1x1(in, got, AS_WVEC(w), b, N, M, H, shift);
     ref_conv2d(in, N, H, w, b, M, 1, 1, 1, shift, exp);
 
     char name[80];
@@ -176,10 +185,10 @@ static int test_avgpool(int C, int H)
 static int test_fc(int N, int M)
 {
     data_t in[1024]; acc_t got[1024], exp[1024];
-    wgt_t  *w = (wgt_t *)malloc(M * N);
+    wgt_t  *w = alloc_w(M * N);
     bias_t *b = (bias_t *)malloc(M * sizeof(bias_t));
     fill_data(in, N, 0, RELU6_MAX); fill_wgt(w, M * N); fill_bias(b, M);
-    fc(in, got, w, b, N, M);
+    fc(in, got, AS_WVEC(w), b, N, M);
     ref_fc(in, N, w, b, M, exp);
     char name[80];
     snprintf(name, sizeof(name), "fc        N=%d M=%d", N, M);
@@ -314,6 +323,10 @@ int main(void)
     errors += test_dwconv3x3(16, 10, 2);    /* 10 -> 5, stride 2 at 160    */
     errors += test_conv1x1(16, 32, 8);
     errors += test_conv1x1(64, 16, 7);
+    errors += test_conv1x1(32, 40, 20);     /* M not a multiple of 16;
+                                               400 pixels = 2 pixel tiles */
+    errors += test_conv1x1(16, 32, 80);     /* largest layer: 6400 pixels  */
+    errors += test_conv1x1(512, 512, 5);    /* most channels               */
     errors += test_avgpool(32, 7);
     errors += test_avgpool(64, 5);          /* final pool at 160 input     */
     errors += test_fc(64, 10);
@@ -350,7 +363,7 @@ int main(void)
     ref_mobilenet(image, weights, biases, shifts, logits_ref, ref_a, ref_b,
                   trace_layer);
     clock_t t1 = clock();
-    mobilenet_top(image, fm, weights, biases, shifts, logits_hw);
+    mobilenet_top(image, fm, AS_WVEC(weights), biases, shifts, logits_hw);
     clock_t t2 = clock();
     printf("  CPU time: reference %.2f s, HLS C model %.2f s\n",
            (double)(t1 - t0) / CLOCKS_PER_SEC, (double)(t2 - t1) / CLOCKS_PER_SEC);
@@ -364,6 +377,17 @@ int main(void)
            t5_hw[0], t5_hw[1], t5_hw[2], t5_hw[3], t5_hw[4],
            t5_ref[0], t5_ref[1], t5_ref[2], t5_ref[3], t5_ref[4]);
     if (!real) printf("  (random weights: class numbers are meaningless)\n");
+
+    /* Save the C model's exact scores: the board run must match them
+     * bit-for-bit (pynq_run.py compares against this file). */
+    if (real) {
+        FILE *lf = fopen("logits_ref.bin", "wb");
+        if (lf) {
+            fwrite(logits_ref, sizeof(acc_t), NUM_CLASSES, lf);
+            fclose(lf);
+            printf("  Saved logits_ref.bin (expected board output)\n");
+        }
+    }
 
     /* Optional: compare with the original float TensorFlow model.
      * This is NOT a pass/fail check (8-bit hardware cannot match float

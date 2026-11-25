@@ -4,13 +4,19 @@
  * Status of each kernel:
  *   conv3x3   OPTIMIZED  row band buffer, 4 outputs x 27 MACs/cycle (v3)
  *   dwconv3x3 OPTIMIZED  on-chip plane + 3x3 window, 9 MACs / cycle (v1)
- *   v3: conv3x3 does 4 output channels per pass instead of 16 at once
- *       (v1: 433 DSPs; an ALLOCATION limit was ignored). dwconv3x3 is the
- *       v1 code (v2/v2.1 address rewrites crashed Vitis HLS 2023.1).
- *   conv1x1   baseline   (local buffers / tiling: teammate's work)
+ *   conv1x1   OPTIMIZED  URAM input buffer, 16x16 MAC array          (v4)
  *   avgpool   baseline   (0.01% of runtime, not worth optimizing)
- *   fc        baseline   (limited by reading 1 weight byte per cycle from
- *                         DDR; speeds up with the 128-bit m_axi step)
+ *   fc        OPTIMIZED  128-bit weights, 16 MACs / cycle             (v5)
+ *
+ * History:
+ *   v1: conv3x3 (16 outputs at II=4, 433 DSPs) + dwconv3x3 optimized.
+ *   v2/v2.1: dwconv3x3 address rewrites crashed Vitis HLS 2023.1;
+ *       an ALLOCATION limit on conv3x3 was ignored. Reverted.
+ *   v3: conv3x3 does 4 output channels per pass -> 109 DSPs.
+ *   v4: conv1x1 optimized (16 output x 16 input channels per cycle,
+ *       input feature map in URAM, weights per output tile on chip).
+ *   v5: 128-bit weight port: every kernel reads 16 weights per cycle
+ *       (wvec_t); fc does 16 MACs per cycle from an on-chip input copy.
  *
  * Every kernel keeps the same function signature as the baseline and must
  * still pass the testbench bit-exactly (make run -> ALL TESTS PASSED).
@@ -49,7 +55,7 @@
 #define C0_TG   4                       /* output channels per pass */
 #define C0_NG   (C0_MAXM / C0_TG)       /* max passes                */
 
-void conv3x3(const data_t *in, data_t *out, const wgt_t *w, const bias_t *b,
+void conv3x3(const data_t *in, data_t *out, const wvec_t *w, const bias_t *b,
              int N, int M, int H, int S, const int8_t *shift)
 {
     const int Ho  = out_size(H, S);
@@ -76,6 +82,19 @@ void conv3x3(const data_t *in, data_t *out, const wgt_t *w, const bias_t *b,
     data_t orow[C0_TG][C0_NG][C0_MAXW];
 #pragma HLS ARRAY_PARTITION variable=orow type=complete dim=1
 
+    /* v5: read all M*N*9 weights 16 per cycle (128-bit words) into a
+     * staging buffer, then spread them into the register file */
+    wgt_t stage[C0_MAXM * C0_MAXN * 9 + WVEC];
+#pragma HLS ARRAY_RESHAPE variable=stage type=cyclic factor=16 dim=1
+    const int nw = (M * N * 9 + WVEC - 1) / WVEC;
+LOAD_WV: for (int i = 0; i < nw; i++) {
+#pragma HLS LOOP_TRIPCOUNT min=27 max=27
+#pragma HLS PIPELINE II=1
+        const wvec_t word = w[i];
+        for (int j = 0; j < WVEC; j++)
+            stage[i * WVEC + j] = word.v[j];
+    }
+
 LOAD_W: for (int to = 0; to < M; to++) {
 #pragma HLS LOOP_TRIPCOUNT min=16 max=16
         const int k = to % C0_TG, g = to / C0_TG;
@@ -84,7 +103,7 @@ LOAD_W: for (int to = 0; to < M; to++) {
     LOAD_WK: for (int t = 0; t < N * 9; t++) {
 #pragma HLS LOOP_TRIPCOUNT min=27 max=27
 #pragma HLS PIPELINE II=1
-            wl[k][g][t] = w[to * N * 9 + t];
+            wl[k][g][t] = stage[to * N * 9 + t];
         }
     }
 
@@ -184,8 +203,9 @@ ROWS: for (int oy = 0; oy < Ho; oy++) {
  * Limit: H <= DW_MAXH.
  * ------------------------------------------------------------------------ */
 #define DW_MAXH 80
+#define DW_MAXC 512
 
-void dwconv3x3(const data_t *in, data_t *out, const wgt_t *w, const bias_t *b,
+void dwconv3x3(const data_t *in, data_t *out, const wvec_t *w, const bias_t *b,
                int C, int H, int S, const int8_t *shift)
 {
     const int Ho  = out_size(H, S);
@@ -213,13 +233,25 @@ ZERO_LR: for (int i = 0; i < H + 2; i++) {
         plane[i][H + 1] = 0;
     }
 
+    /* v5: all C*9 weights of the layer, read 16 per cycle (128-bit) */
+    wgt_t wall[DW_MAXC * 9 + WVEC];
+#pragma HLS ARRAY_RESHAPE variable=wall type=cyclic factor=16 dim=1
+    const int nw = (C * 9 + WVEC - 1) / WVEC;
+LOAD_WV: for (int i = 0; i < nw; i++) {
+#pragma HLS LOOP_TRIPCOUNT min=9 max=288
+#pragma HLS PIPELINE II=1
+        const wvec_t word = w[i];
+        for (int j = 0; j < WVEC; j++)
+            wall[i * WVEC + j] = word.v[j];
+    }
+
 CH: for (int c = 0; c < C; c++) {
 #pragma HLS LOOP_TRIPCOUNT min=16 max=512
         wgt_t wr[9];
 #pragma HLS ARRAY_PARTITION variable=wr type=complete dim=1
     LOAD_W: for (int k = 0; k < 9; k++) {
 #pragma HLS PIPELINE II=1
-            wr[k] = w[c * 9 + k];
+            wr[k] = wall[c * 9 + k];
         }
         const acc_t bc = b[c];
         const int   sh = shift[c];
@@ -276,28 +308,137 @@ CH: for (int c = 0; c < C; c++) {
 /* ------------------------------------------------------------------------
  * Pointwise 1x1 convolution: at every pixel, out[to] = sum_ti w[to][ti]*in[ti]
  *   in [N][H][H]   out [M][H][H]   w [M][N]   b [M]
+ *
+ * OPTIMIZATION (baseline: N+33 cycles per output value, 91.6 M cycles,
+ * 85% of the whole network)
+ *   1. LOAD_IN  : burst-read the whole input feature map (N x H*H, at most
+ *                 102,400 values) once into an on-chip buffer in URAM,
+ *                 split into PW_TN = 16 banks (bank = input channel % 16).
+ *   2. For each tile of PW_TM = 16 output channels:
+ *      a. LOAD_W  : read that tile's 16 x N weights (sequential DDR) into
+ *                   registers; 16 weights of a row are packed in one word.
+ *      b. COMPUTE : per pixel, walk the input channels 16 at a time:
+ *                   16 outputs x 16 inputs = 256 MACs per cycle, II=1
+ *                   (~256 DSPs). Partial sums stay in registers.
+ *      c. WRITE   : finished pixels (PW_TP at a time) go to a small output
+ *                   buffer and are burst-written to DDR channel by channel.
+ * Each input value is read from DDR once (not once per output channel),
+ * each weight once, each output written once.
+ * Expected cycles per layer ~ N*HW (load) + (M/16) * (16*N + HW*N/16
+ *   + 16*HW + fills)   -> about 2.5 M cycles for all 13 layers (~35x).
+ *   Most of that is DDR transfers at one value per cycle; the 128-bit
+ *   m_axi step shrinks it further.
+ * Limits: N <= PW_MAXN, N*H*H <= PW_TN*PW_IBD, N a multiple of 16
+ * (v5: each weight row is read as N/16 128-bit words), M any.
  * ------------------------------------------------------------------------ */
-void conv1x1(const data_t *in, data_t *out, const wgt_t *w, const bias_t *b,
+#define PW_TM   16          /* output channels in parallel         */
+#define PW_TN   16          /* input channels in parallel          */
+#define PW_MAXN 512         /* largest input channel count         */
+#define PW_IBD  6400        /* input buffer depth per bank: 16 x 6400 = 102,400 = largest N*H*H  */
+#define PW_TP   256         /* pixels per output-buffer tile       */
+
+void conv1x1(const data_t *in, data_t *out, const wvec_t *w, const bias_t *b,
              int N, int M, int H, const int8_t *shift)
 {
     const int HW = H * H;
+    const int NT = (N + PW_TN - 1) / PW_TN;     /* input-channel groups  */
+    const int MT = (M + PW_TM - 1) / PW_TM;     /* output-channel tiles  */
 
-ROW: for (int row = 0; row < H; row++) {
-#pragma HLS LOOP_TRIPCOUNT min=5 max=80
-    COL: for (int col = 0; col < H; col++) {
-#pragma HLS LOOP_TRIPCOUNT min=5 max=80
-        TO: for (int to = 0; to < M; to++) {
-#pragma HLS LOOP_TRIPCOUNT min=32 max=512
-            acc_t acc = b[to];
-            TI: for (int ti = 0; ti < N; ti++) {
+    /* ibuf[j][g*HW + p] = input channel (g*16 + j), pixel p */
+    data_t ibuf[PW_TN][PW_IBD];
+#pragma HLS ARRAY_PARTITION variable=ibuf type=complete dim=1
+#pragma HLS BIND_STORAGE variable=ibuf type=ram_2p impl=uram
+
+    /* wt[k][ti]: weight of output (tile*16 + k), input ti. The 16 weights
+     * read together (ti = g*16 .. g*16+15) are packed into one word. */
+    wgt_t wt[PW_TM][PW_MAXN];
+#pragma HLS ARRAY_PARTITION variable=wt type=complete dim=1
+#pragma HLS ARRAY_RESHAPE variable=wt type=cyclic factor=16 dim=2
+
+    bias_t bt[PW_TM];
+    int8_t st[PW_TM];
+    acc_t  acc[PW_TM];
+    data_t obuf[PW_TM][PW_TP];
+#pragma HLS ARRAY_PARTITION variable=bt   type=complete dim=1
+#pragma HLS ARRAY_PARTITION variable=st   type=complete dim=1
+#pragma HLS ARRAY_PARTITION variable=acc  type=complete dim=1
+#pragma HLS ARRAY_PARTITION variable=obuf type=complete dim=1
+
+    /* 1. input feature map -> on-chip (sequential DDR addresses) */
+LOAD_IN: for (int ti = 0; ti < N; ti++) {
 #pragma HLS LOOP_TRIPCOUNT min=16 max=512
-                acc += (acc_t)in[ti * HW + row * H + col] *
-                       (acc_t)w[to * N + ti];
-            }
-            out[to * HW + row * H + col] = requant(acc, shift[to], 1);
+        const int src  = ti * HW;
+        const int dst  = (ti / PW_TN) * HW;
+        const int bank = ti % PW_TN;
+    LOAD_IN_P: for (int p = 0; p < HW; p++) {
+#pragma HLS LOOP_TRIPCOUNT min=25 max=6400
+#pragma HLS PIPELINE II=1
+            ibuf[bank][dst + p] = in[src + p];
         }
     }
-}
+
+TILE: for (int mt = 0; mt < MT; mt++) {
+#pragma HLS LOOP_TRIPCOUNT min=2 max=32
+        const int to0 = mt * PW_TM;
+
+        /* 2a. this tile's weights, bias, shift (zero for missing rows/cols) */
+    LOAD_WK: for (int k = 0; k < PW_TM; k++) {
+            const bool row_ok = (to0 + k < M);
+            bt[k] = row_ok ? b[to0 + k] : 0;
+            st[k] = row_ok ? shift[to0 + k] : (int8_t)1;
+            /* v5: one 128-bit word = 16 weights of this row per cycle */
+            const int wbase = (to0 + k) * NT;     /* = (to0+k)*N/16 */
+        LOAD_WT: for (int g = 0; g < NT; g++) {
+#pragma HLS LOOP_TRIPCOUNT min=1 max=32
+#pragma HLS PIPELINE II=1
+                wvec_t word;
+                if (row_ok) word = w[wbase + g];
+                for (int j = 0; j < PW_TN; j++)
+                    wt[k][g * PW_TN + j] = row_ok ? word.v[j] : (wgt_t)0;
+            }
+        }
+
+    PTILE: for (int p0 = 0; p0 < HW; p0 += PW_TP) {
+#pragma HLS LOOP_TRIPCOUNT min=1 max=25
+            const int np = (HW - p0 < PW_TP) ? (HW - p0) : PW_TP;
+
+            /* 2b. 256 MACs per cycle */
+        PIX: for (int pp = 0; pp < np; pp++) {
+#pragma HLS LOOP_TRIPCOUNT min=25 max=256
+            GRP: for (int g = 0; g < NT; g++) {
+#pragma HLS LOOP_TRIPCOUNT min=1 max=32
+#pragma HLS PIPELINE II=1
+                    const int addr = g * HW + p0 + pp;
+                    data_t x[PW_TN];
+#pragma HLS ARRAY_PARTITION variable=x type=complete dim=1
+                    for (int j = 0; j < PW_TN; j++)
+                        x[j] = ibuf[j][addr];
+
+                    for (int k = 0; k < PW_TM; k++) {
+                        acc_t part = 0;
+                        for (int j = 0; j < PW_TN; j++)
+                            part += (acc_t)wt[k][g * PW_TN + j] * (acc_t)x[j];
+                        const acc_t s = ((g == 0) ? bt[k] : acc[k]) + part;
+                        acc[k] = s;
+                        if (g == NT - 1)
+                            obuf[k][pp] = requant(s, st[k], 1);
+                    }
+                }
+            }
+
+            /* 2c. burst-write this pixel tile, one output channel at a time */
+        WRITE_K: for (int k = 0; k < PW_TM; k++) {
+                if (to0 + k < M) {
+                    const int obase = (to0 + k) * HW + p0;
+                WRITE_P: for (int pp = 0; pp < np; pp++) {
+#pragma HLS LOOP_TRIPCOUNT min=25 max=256
+#pragma HLS PIPELINE II=1
+                        out[obase + pp] = obuf[k][pp];
+                    }
+                }
+            }
+        }
+    }
 }
 
 /* ------------------------------------------------------------------------
@@ -321,18 +462,41 @@ CH: for (int c = 0; c < C; c++) {
 
 /* ------------------------------------------------------------------------
  * Classifier (Conv2d_1c_1x1): mathematically a 1x1 conv on a 1x1 map.
- * Kept separate here only because it outputs raw int32 scores (no ReLU6,
- * no clamp), so argmax is exact.   in [N]  logits [M]  w [M][N]  b [M]
+ * Kept separate because it outputs raw int32 scores (no ReLU6, no clamp),
+ * so argmax is exact.   in [N]  logits [M]  w [M][N]  b [M]
+ *
+ * OPTIMIZATION (v5; baseline: 1 weight byte per cycle, 530,530 cycles)
+ *   - the N pooled inputs are copied on chip once (16 banks)
+ *   - each 128-bit weight word gives 16 weights -> 16 MACs per cycle
+ *   Expected: 512 + 1001 x (N/16 + ~12) = ~45 K cycles (~12x).
+ * Limits: N <= FC_MAXN, N a multiple of 16.
  * ------------------------------------------------------------------------ */
-void fc(const data_t *in, acc_t *logits, const wgt_t *w, const bias_t *b,
+#define FC_MAXN 512
+
+void fc(const data_t *in, acc_t *logits, const wvec_t *w, const bias_t *b,
         int N, int M)
 {
+    const int NG = N / WVEC;
+    data_t x[FC_MAXN];
+#pragma HLS ARRAY_PARTITION variable=x type=cyclic factor=16 dim=1
+
+LOAD_X: for (int ti = 0; ti < N; ti++) {
+#pragma HLS LOOP_TRIPCOUNT min=512 max=512
+#pragma HLS PIPELINE II=1
+        x[ti] = in[ti];
+    }
+
 TO: for (int to = 0; to < M; to++) {
 #pragma HLS LOOP_TRIPCOUNT min=1001 max=1001
         acc_t acc = b[to];
-    TI: for (int ti = 0; ti < N; ti++) {
-#pragma HLS LOOP_TRIPCOUNT min=512 max=512
-            acc += (acc_t)in[ti] * (acc_t)w[to * N + ti];
+    TI: for (int g = 0; g < NG; g++) {
+#pragma HLS LOOP_TRIPCOUNT min=32 max=32
+#pragma HLS PIPELINE II=1
+            const wvec_t word = w[to * NG + g];
+            acc_t part = 0;
+            for (int j = 0; j < WVEC; j++)
+                part += (acc_t)word.v[j] * (acc_t)x[g * WVEC + j];
+            acc += part;
         }
         logits[to] = acc;
     }
