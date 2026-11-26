@@ -38,3 +38,7 @@ overlay/
 *.jou
 vitis_status.txt
 vivado_status.txt
+vivado_prj_*_kr260/
+overlay_*_kr260/
+build_kr260_*.tcl
+kr260_status.txt
