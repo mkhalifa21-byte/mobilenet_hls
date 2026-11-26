@@ -317,11 +317,12 @@ CH: for (int c = 0; c < C; c++) {
  *   2. For each tile of PW_TM = 16 output channels:
  *      a. LOAD_W  : read that tile's 16 x N weights (sequential DDR) into
  *                   registers; 16 weights of a row are packed in one word.
- *      b. COMPUTE : per pixel, walk the input channels 16 at a time:
- *                   16 outputs x 16 inputs = 256 MACs per cycle, II=1
- *                   (~256 DSPs). Partial sums stay in registers.
- *      c. WRITE   : finished pixels (PW_TP at a time) go to a small output
- *                   buffer and are burst-written to DDR channel by channel.
+ *      b. COMPUTE : for each group of 16 input channels, walk the pixels
+ *                   of the tile (PW_TP at a time): 16 outputs x 16 inputs
+ *                   = 256 MACs per cycle, II=1 (~256 DSPs). Partial sums
+ *                   stay in a small on-chip memory, one per pixel (v6).
+ *      c. WRITE   : requantize the finished pixels and burst-write them to
+ *                   DDR channel by channel.
  * Each input value is read from DDR once (not once per output channel),
  * each weight once, each output written once.
  * Expected cycles per layer ~ N*HW (load) + (M/16) * (16*N + HW*N/16
@@ -334,7 +335,8 @@ CH: for (int c = 0; c < C; c++) {
 #define PW_TM   16          /* output channels in parallel         */
 #define PW_TN   16          /* input channels in parallel          */
 #define PW_MAXN 512         /* largest input channel count         */
-#define PW_IBD  6400        /* input buffer depth per bank: 16 x 6400 = 102,400 = largest N*H*H  */
+#define PW_IBD  6400        /* input buffer depth per bank:
+                               16 x 6400 = 102,400 = largest N*H*H  */
 #define PW_TP   256         /* pixels per output-buffer tile       */
 
 void conv1x1(const data_t *in, data_t *out, const wvec_t *w, const bias_t *b,
@@ -357,12 +359,12 @@ void conv1x1(const data_t *in, data_t *out, const wvec_t *w, const bias_t *b,
 
     bias_t bt[PW_TM];
     int8_t st[PW_TM];
-    acc_t  acc[PW_TM];
-    data_t obuf[PW_TM][PW_TP];
+    /* v6: running sums live in a small memory, one entry per pixel of the
+     * tile, instead of one register per output channel (see 2b). */
+    acc_t  accb[PW_TM][PW_TP];
 #pragma HLS ARRAY_PARTITION variable=bt   type=complete dim=1
 #pragma HLS ARRAY_PARTITION variable=st   type=complete dim=1
-#pragma HLS ARRAY_PARTITION variable=acc  type=complete dim=1
-#pragma HLS ARRAY_PARTITION variable=obuf type=complete dim=1
+#pragma HLS ARRAY_PARTITION variable=accb type=complete dim=1
 
     /* 1. input feature map -> on-chip (sequential DDR addresses) */
 LOAD_IN: for (int ti = 0; ti < N; ti++) {
@@ -402,12 +404,22 @@ TILE: for (int mt = 0; mt < MT; mt++) {
 #pragma HLS LOOP_TRIPCOUNT min=1 max=25
             const int np = (HW - p0 < PW_TP) ? (HW - p0) : PW_TP;
 
-            /* 2b. 256 MACs per cycle */
-        PIX: for (int pp = 0; pp < np; pp++) {
-#pragma HLS LOOP_TRIPCOUNT min=25 max=256
-            GRP: for (int g = 0; g < NT; g++) {
+            /* 2b. 256 MACs per cycle.
+             * v6 (for 250 MHz): input group g is the OUTER loop and the pixel
+             * the inner one. A pixel's running sum is now updated only once
+             * every np cycles (np >= 25), so the add no longer has to finish
+             * in the same clock cycle as the previous add of the same sum.
+             * In v5 (pixel outer, g inner) that one-cycle loop -- DSP output
+             * -> add/select in logic -> DSP input -- was the slowest path in
+             * the whole design at 4 ns (4.19 ns, WNS -0.194 ns).
+             * Same pixels, same order of additions per pixel -> bit-exact,
+             * and the same number of cycles. */
+        GRP: for (int g = 0; g < NT; g++) {
 #pragma HLS LOOP_TRIPCOUNT min=1 max=32
+            PIX: for (int pp = 0; pp < np; pp++) {
+#pragma HLS LOOP_TRIPCOUNT min=25 max=256
 #pragma HLS PIPELINE II=1
+#pragma HLS DEPENDENCE variable=accb type=inter dependent=true distance=25
                     const int addr = g * HW + p0 + pp;
                     data_t x[PW_TN];
 #pragma HLS ARRAY_PARTITION variable=x type=complete dim=1
@@ -418,22 +430,20 @@ TILE: for (int mt = 0; mt < MT; mt++) {
                         acc_t part = 0;
                         for (int j = 0; j < PW_TN; j++)
                             part += (acc_t)wt[k][g * PW_TN + j] * (acc_t)x[j];
-                        const acc_t s = ((g == 0) ? bt[k] : acc[k]) + part;
-                        acc[k] = s;
-                        if (g == NT - 1)
-                            obuf[k][pp] = requant(s, st[k], 1);
+                        accb[k][pp] = ((g == 0) ? bt[k] : accb[k][pp]) + part;
                     }
                 }
             }
 
-            /* 2c. burst-write this pixel tile, one output channel at a time */
+            /* 2c. requantize + burst-write this pixel tile, one output channel
+             *     at a time */
         WRITE_K: for (int k = 0; k < PW_TM; k++) {
                 if (to0 + k < M) {
                     const int obase = (to0 + k) * HW + p0;
                 WRITE_P: for (int pp = 0; pp < np; pp++) {
 #pragma HLS LOOP_TRIPCOUNT min=25 max=256
 #pragma HLS PIPELINE II=1
-                        out[obase + pp] = obuf[k][pp];
+                        out[obase + pp] = requant(accb[k][pp], st[k], 1);
                     }
                 }
             }
